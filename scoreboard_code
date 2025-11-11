@@ -1,0 +1,370 @@
+/*
+  Dodgeball Timer + Scoreboard (ESP32) - 4 LEDs per segment, no colon LEDs
+
+  Features in this file:
+  - 4 LEDs per segment
+  - Colon LEDs removed (use sticker for dots)
+  - Timer digits (0..3): GREEN normally, FLASH during the last 10s
+  - Team A digits (4..5): BLUE
+  - Team B digits (6..7): RED
+  - IR support (GPIO15) — no learn mode
+  - Improved IR handling: treats 0xFFFFFFFF as repeat of last non-repeat code so handling is reliable
+  - Brightness +/- IR commands and persistent brightness saved via Preferences
+
+  Wiring reminders:
+  - WS2812 data pin -> DATA_PIN (GPIO5 in this sketch) through ~220-470Ω series resistor
+  - +5V to LED strip (use appropriate PSU), GND common with ESP32
+  - IR module: S -> IR_PIN (GPIO15), - -> GND, VCC -> 3.3V (preferred)
+  - Place 1000µF cap across +5V/GND at LED input
+*/
+
+#include <FastLED.h>
+#include <IRremote.h>
+#include <Preferences.h>
+
+// ====== HARDWARE CONFIG (change these to match your wiring) ======
+#define DATA_PIN       5    // WS2812 data pin (GPIO5 example)
+#define IR_PIN         15   // IR receiver data pin fixed to GPIO15
+#define LED_ORDER      GRB  // WS2812 color order
+
+// Digit configuration
+#define NUM_TIMER_DIGITS 4      // MM:SS
+#define SCORE_DIGITS_TOTAL 4    // 2 digits per team, total 4 score digits
+#define LEDS_PER_SEGMENT 4      // 4 LEDs per segment
+#define SEGMENTS_PER_DIGIT 7
+#define LEDS_PER_DIGIT (LEDS_PER_SEGMENT * SEGMENTS_PER_DIGIT) // 28 LEDs per digit
+
+// Derived totals
+const uint8_t TOTAL_DIGITS = NUM_TIMER_DIGITS + SCORE_DIGITS_TOTAL; // 8
+const uint16_t TOTAL_LEDS = TOTAL_DIGITS * LEDS_PER_DIGIT; // 8 * 28 = 224
+
+// ====== LED / COLOR CONFIG ======
+CRGB leds[TOTAL_LEDS];
+
+// Default brightness if none stored (0-255). Keep conservative for bench testing.
+const uint8_t DEFAULT_BRIGHTNESS = 64;
+
+// Current brightness (mutable & persisted)
+uint8_t currentBrightness = DEFAULT_BRIGHTNESS;
+
+// Brightness step: ~10% of 255
+const uint8_t BRIGHTNESS_STEP = max(1, (255 * 10) / 100); // ~25
+
+// Timer colors
+const CRGB COLOR_TIMER_DEFAULT = CRGB::Green;
+const CRGB COLOR_TIMER_FINISHED = CRGB::Blue; // when timer hits zero
+
+// Team colors
+const CRGB COLOR_TEAM_A = CRGB::Blue;  // digits 4 & 5
+const CRGB COLOR_TEAM_B = CRGB::Red;   // digits 6 & 7
+
+// ====== TIMER CONFIG ======
+const uint32_t DEFAULT_SECONDS = 20 * 60; // 20 minutes default
+volatile uint32_t remainingSeconds = DEFAULT_SECONDS;
+
+enum TimerState { STOPPED, RUNNING, PAUSED };
+volatile TimerState timerState = STOPPED;
+
+// ====== SCORE STATE ======
+uint8_t teamA = 0; // 0..99
+uint8_t teamB = 0; // 0..99
+
+// ====== TIMING ======
+unsigned long lastTick = 0;
+const unsigned long TICK_MS = 200; // refresh display 5x/sec
+unsigned long lastSecondUpdate = 0;
+
+// blinking control for last 10s
+bool blinkOn = true;
+unsigned long lastBlinkToggle = 0;
+const unsigned long BLINK_INTERVAL_MS = 500;
+
+// ====== IR CODES (defaults) ======
+// Example NEC-style codes. Replace with your learned codes if desired.
+uint32_t IR_START_PAUSE = 0xFFA25D;  // start/pause toggle example
+uint32_t IR_RESET       = 0xFFE21D;  // reset example
+uint32_t IR_MIN_PLUS    = 0xFF629D;  // +1 minute
+uint32_t IR_MIN_MINUS   = 0xFF22DD;  // -1 minute
+uint32_t IR_SEC_PLUS    = 0xFF02FD;  // +1 second
+uint32_t IR_SEC_MINUS   = 0xFFC23D;  // -1 second
+uint32_t IR_TEAMA_PLUS  = 0xFFA857;  // team A +
+uint32_t IR_TEAMA_MINUS = 0xFF6897;  // team A -
+uint32_t IR_TEAMB_PLUS  = 0xFF9867;  // team B +
+uint32_t IR_TEAMB_MINUS = 0xFFB04F;  // team B -
+uint32_t IR_BRIGHT_PLUS = 0xFF30CF;  // brightness +10%
+uint32_t IR_BRIGHT_MINUS= 0xFF18E7;  // brightness -10%
+
+// ====== SEGMENT MAPPING ======
+// bit order: bit0=a, bit1=b, bit2=c, bit3=d, bit4=e, bit5=f, bit6=g
+const uint8_t digitSegments[10] = {
+  0x3F, // 0: a b c d e f
+  0x06, // 1: b c
+  0x5B, // 2: a b g e d
+  0x4F, // 3: a b c d g
+  0x66, // 4: f g b c
+  0x6D, // 5: a f g c d
+  0x7D, // 6: a f e d c g
+  0x07, // 7: a b c
+  0x7F, // 8: all
+  0x6F  // 9: a b c d f g
+};
+
+// start index of each digit in the LED chain; will be filled in setup()
+uint16_t digitStartIndex[TOTAL_DIGITS];
+
+// ====== IR RECEIVER (classic API) ======
+IRrecv irrecv(IR_PIN);
+decode_results results;
+// last non-repeat code to handle 0xFFFFFFFF repeat values
+uint32_t lastNonRepeatCode = 0;
+
+// ====== Preferences for persistence ======
+Preferences prefs;
+const char* PREF_NAMESPACE = "dodgeball";
+const char* PREF_BRIGHT = "brightness";
+
+// ====== HELPERS ======
+
+void persistBrightness() {
+  prefs.putUInt(PREF_BRIGHT, (uint32_t)currentBrightness);
+  Serial.print("Brightness persisted: ");
+  Serial.println(currentBrightness);
+}
+
+void applyBrightness(uint8_t b) {
+  currentBrightness = b;
+  FastLED.setBrightness(currentBrightness);
+  Serial.print("Brightness applied: ");
+  Serial.println(currentBrightness);
+  persistBrightness();
+}
+
+void increaseBrightness() {
+  uint16_t nb = (uint16_t)currentBrightness + BRIGHTNESS_STEP;
+  if (nb > 255) nb = 255;
+  applyBrightness((uint8_t)nb);
+}
+
+void decreaseBrightness() {
+  int16_t nb = (int16_t)currentBrightness - BRIGHTNESS_STEP;
+  if (nb < 0) nb = 0;
+  applyBrightness((uint8_t)nb);
+}
+
+void setSegmentLEDs(uint16_t start, uint8_t segment, CRGB color) {
+  uint16_t base = start + (segment * LEDS_PER_SEGMENT);
+  for (uint8_t k = 0; k < LEDS_PER_SEGMENT; ++k) {
+    uint16_t idx = base + k;
+    if (idx < TOTAL_LEDS) leds[idx] = color;
+  }
+}
+
+void clearSegmentLEDs(uint16_t start, uint8_t segment) {
+  uint16_t base = start + (segment * LEDS_PER_SEGMENT);
+  for (uint8_t k = 0; k < LEDS_PER_SEGMENT; ++k) {
+    uint16_t idx = base + k;
+    if (idx < TOTAL_LEDS) leds[idx] = CRGB::Black;
+  }
+}
+
+void setDigitValue(uint8_t digitIndex, uint8_t value, CRGB color, bool on) {
+  if (digitIndex >= TOTAL_DIGITS) return;
+  uint16_t start = digitStartIndex[digitIndex];
+  uint8_t segmask = (value < 10) ? digitSegments[value] : 0;
+  for (uint8_t s = 0; s < SEGMENTS_PER_DIGIT; ++s) {
+    if (on && (segmask & (1 << s))) {
+      setSegmentLEDs(start, s, color);
+    } else {
+      clearSegmentLEDs(start, s);
+    }
+  }
+}
+
+void drawScore(uint8_t startDigit, uint8_t score, CRGB color, bool on) {
+  uint8_t tens = score / 10;
+  uint8_t ones = score % 10;
+  setDigitValue(startDigit, tens, color, on);
+  setDigitValue(startDigit + 1, ones, color, on);
+}
+
+void updateDisplay() {
+  // choose timer color: always green unless finished
+  CRGB timerColor = COLOR_TIMER_DEFAULT;
+  if (remainingSeconds == 0) {
+    timerColor = COLOR_TIMER_FINISHED;
+  }
+
+  // visible toggles only affect timer digits (flash in last 10s)
+  bool timerVisible = true;
+  if (remainingSeconds <= 10) {
+    timerVisible = blinkOn;
+  } else {
+    timerVisible = true;
+  }
+
+  // clear all LEDs
+  for (uint16_t i = 0; i < TOTAL_LEDS; ++i) leds[i] = CRGB::Black;
+
+  // Timer: digits 0..3 => mm:ss (digit 0 = minutes tens)
+  uint32_t s = remainingSeconds;
+  uint8_t mm = s / 60;
+  uint8_t ss = s % 60;
+  setDigitValue(0, mm / 10, timerColor, timerVisible);
+  setDigitValue(1, mm % 10, timerColor, timerVisible);
+  setDigitValue(2, ss / 10, timerColor, timerVisible);
+  setDigitValue(3, ss % 10, timerColor, timerVisible);
+
+  // Scores: digits 4..7
+  // Team A digits 4 & 5 => blue
+  setDigitValue(4, teamA / 10, COLOR_TEAM_A, true);
+  setDigitValue(5, teamA % 10, COLOR_TEAM_A, true);
+  // Team B digits 6 & 7 => red
+  setDigitValue(6, teamB / 10, COLOR_TEAM_B, true);
+  setDigitValue(7, teamB % 10, COLOR_TEAM_B, true);
+
+  FastLED.show();
+}
+
+// ====== IR handling helpers ======
+
+void handleIRCode(uint32_t code) {
+  if (code == IR_START_PAUSE) {
+    if (timerState == RUNNING) timerState = PAUSED;
+    else {
+      if (timerState == STOPPED && remainingSeconds == 0) remainingSeconds = DEFAULT_SECONDS;
+      timerState = RUNNING;
+    }
+  } else if (code == IR_RESET) {
+    remainingSeconds = DEFAULT_SECONDS;
+    timerState = STOPPED;
+  } else if (code == IR_MIN_PLUS) {
+    remainingSeconds += 60;
+  } else if (code == IR_MIN_MINUS) {
+    if (remainingSeconds >= 60) remainingSeconds -= 60;
+    else remainingSeconds = 0;
+  } else if (code == IR_SEC_PLUS) {
+    remainingSeconds += 1;
+  } else if (code == IR_SEC_MINUS) {
+    if (remainingSeconds >= 1) remainingSeconds -= 1;
+    else remainingSeconds = 0;
+  } else if (code == IR_TEAMA_PLUS) {
+    if (teamA < 99) ++teamA;
+  } else if (code == IR_TEAMA_MINUS) {
+    if (teamA > 0) --teamA;
+  } else if (code == IR_TEAMB_PLUS) {
+    if (teamB < 99) ++teamB;
+  } else if (code == IR_TEAMB_MINUS) {
+    if (teamB > 0) --teamB;
+  } else if (code == IR_BRIGHT_PLUS) {
+    increaseBrightness();
+  } else if (code == IR_BRIGHT_MINUS) {
+    decreaseBrightness();
+  } else {
+    Serial.print("Unknown IR code: 0x"); Serial.println(code, HEX);
+  }
+}
+
+// ====== SETUP ======
+void setupDigitMapping() {
+  uint16_t running = 0;
+  // digits 0..TOTAL_DIGITS-1, no colon LEDs
+  for (uint8_t d = 0; d < TOTAL_DIGITS; ++d) {
+    digitStartIndex[d] = running;
+    running += LEDS_PER_DIGIT;
+  }
+  if (running != TOTAL_LEDS) {
+    Serial.print("Warning: LED count mismatch. running="); Serial.print(running);
+    Serial.print(" TOTAL_LEDS="); Serial.println(TOTAL_LEDS);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("Dodgeball Timer + Scoreboard (ESP32) starting...");
+
+  // initialize preferences and load saved brightness (if any)
+  prefs.begin(PREF_NAMESPACE, false);
+  uint32_t saved = prefs.getUInt(PREF_BRIGHT, (uint32_t)DEFAULT_BRIGHTNESS);
+  if (saved > 255) saved = DEFAULT_BRIGHTNESS;
+  currentBrightness = (uint8_t)saved;
+  Serial.print("Loaded saved brightness: ");
+  Serial.println(currentBrightness);
+
+  FastLED.addLeds<WS2812B, DATA_PIN, LED_ORDER>(leds, TOTAL_LEDS);
+  FastLED.setBrightness(currentBrightness);
+
+  setupDigitMapping();
+
+  // Initialize IR
+  irrecv.enableIRIn();
+
+  // default state
+  remainingSeconds = DEFAULT_SECONDS;
+  timerState = STOPPED;
+  teamA = 0; teamB = 0;
+
+  updateDisplay();
+}
+
+// ====== MAIN LOOP ======
+void loop() {
+  unsigned long now = millis();
+
+  // IR handling: use lastNonRepeatCode to make handling reliable.
+  if (irrecv.decode(&results)) {
+    uint32_t code = results.value;
+
+    if (code == 0xFFFFFFFF) {
+      // repeat code: treat as repeat of last known non-repeat decode
+      Serial.println("IR repeat (0xFFFFFFFF) received - treating as repeat");
+      code = lastNonRepeatCode;
+    } else {
+      lastNonRepeatCode = code;
+    }
+
+    if (code != 0) {
+      Serial.print("IR code: 0x"); Serial.println(code, HEX);
+      handleIRCode(code);
+    } else {
+      Serial.println("No valid IR code available");
+    }
+
+    irrecv.resume(); // receive next value
+  }
+
+  // Serial commands (no learn mode)
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 's' || c == 'S') {
+      Serial.print("Remaining: "); Serial.print(remainingSeconds); Serial.print(" s, state ");
+      Serial.println((timerState==RUNNING)?"RUNNING":(timerState==PAUSED?"PAUSED":"STOPPED"));
+      Serial.print("TeamA: "); Serial.print(teamA); Serial.print(" TeamB: "); Serial.println(teamB);
+      Serial.print("Brightness: "); Serial.println(currentBrightness);
+    }
+  }
+
+  // Timer update: decrement every 1000ms when running
+  if (timerState == RUNNING) {
+    if (now - lastSecondUpdate >= 1000) {
+      if (remainingSeconds > 0) --remainingSeconds;
+      else {
+        remainingSeconds = 0;
+        timerState = STOPPED;
+      }
+      lastSecondUpdate = now;
+    }
+  }
+
+  // blink toggle for last 10 seconds
+  if (now - lastBlinkToggle >= BLINK_INTERVAL_MS) {
+    blinkOn = !blinkOn;
+    lastBlinkToggle = now;
+  }
+
+  // refresh display
+  if (now - lastTick >= TICK_MS) {
+    updateDisplay();
+    lastTick = now;
+  }
+}
